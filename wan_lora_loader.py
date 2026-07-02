@@ -270,6 +270,37 @@ def build_lora_tree() -> List[Dict[str, Any]]:
 # Server routes
 # ---------------------------------------------------------------------------
 
+def _read_txt_file(path: str) -> str:
+    """Read a text file, trying multiple encodings to avoid garbled output.
+
+    On Chinese Windows systems, TXT files are often encoded in GBK / GB2312
+    rather than UTF-8.  We try the most common encodings in order.
+    """
+    # Read raw bytes first so we can retry without re-opening.
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    # BOM detection: UTF-8 BOM → strip and decode as UTF-8
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", errors="replace")
+    # UTF-16 LE BOM
+    if raw.startswith(b"\xff\xfe"):
+        return raw[2:].decode("utf-16-le", errors="replace")
+    # UTF-16 BE BOM
+    if raw.startswith(b"\xfe\xff"):
+        return raw[2:].decode("utf-16-be", errors="replace")
+
+    # Try encodings in order of likelihood.
+    for enc in ("utf-8", "gbk", "gb2312", "utf-16-le", "utf-16-be", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    # Ultimate fallback – never fails but may produce mojibake.
+    return raw.decode("latin-1")
+
+
 def find_txt_for(lora_filename: str) -> Dict[str, Any]:
     """Find a .txt file in the same directory as the given LoRA file.
 
@@ -306,8 +337,7 @@ def find_txt_for(lora_filename: str) -> Dict[str, Any]:
     txt_path = os.path.join(abs_dir, txt_name)
 
     try:
-        with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
+        content = _read_txt_file(txt_path)
     except Exception:
         content = ""
 
