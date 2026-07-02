@@ -2,7 +2,7 @@
 
 ComfyUI 自定义节点，专为 **WAN 2.2** 设计的高噪/低噪成对 LoRA 加载器。**单个节点**即可完成双模型输入、多组 LoRA 配对加载、双模型输出。
 
-灵感来自 [rgthree-comfy](https://github.com/rgthree/rgthree-comfy) 的 **Power Lora Loader**。
+灵感来自 [rgthree-comfy](https://github.com/rgthree/rgthree-comfy) 的 **Power Lora Loader**。现在才突然想起来做这个插件....
 
 ---
 
