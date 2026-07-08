@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 
 import folder_paths
@@ -20,6 +22,8 @@ import folder_paths
 
 NODE_NAME = "WanLoraLoader (zyf-WAN-Lora-Loader)"
 DISPLAY_NAME = "Wan 2.2 LoRA Loader (zyf)"
+SINGLE_NODE_NAME = "SingleLoraLoader (zyf-WAN-Lora-Loader)"
+SINGLE_DISPLAY_NAME = "Simple LoRA Loader (zyf)"
 CATEGORY = "zyf-WAN-Lora-Loader"
 
 # Patterns that match a "_high"/"_low" / "_HIGH"/"_LOW" marker in a WAN 2.2
@@ -237,16 +241,26 @@ def build_lora_tree() -> List[Dict[str, Any]]:
         # Sort dirs in-place to ensure consistent ordering.
         dirs.sort()
 
+    def _natural_sort_key(s: str):
+        """Split string into alternating text/number parts for natural sort.
+
+        E.g. "09_foo" -> ["09", "_foo"] -> [9, "_foo"]
+             "100_bar" -> ["100", "_bar"] -> [100, "_bar"]
+        This ensures "100" sorts after "99" instead of after "09".
+        """
+        parts = re.split(r"(\d+)", s)
+        return [int(p) if p.isdigit() else p.lower() for p in parts]
+
     def _build_from(parent: str) -> List[Dict[str, Any]]:
         children = parent_map.get(parent, [])
-        # Sort: folders first (alphabetically), then files (alphabetically).
+        # Sort: folders first (natural sort), then files (natural sort).
         folders = sorted(
             [c for c in children if c[1]],
-            key=lambda c: c[0].lower(),
+            key=lambda c: _natural_sort_key(c[0]),
         )
         files = sorted(
             [c for c in children if not c[1]],
-            key=lambda c: c[0].lower(),
+            key=lambda c: _natural_sort_key(c[0]),
         )
         nodes: List[Dict[str, Any]] = []
         for name, _, path in folders:
@@ -305,7 +319,7 @@ def find_txt_for(lora_filename: str) -> Dict[str, Any]:
     """Find a .txt file in the same directory as the given LoRA file.
 
     Returns:
-        { "found": True, "path": "<relative_path>", "content": "..." }
+        { "found": True, "path": "<relative_path>", "content": "...", "encoding": "..." }
         or { "found": False }
     """
     if not lora_filename:
@@ -337,11 +351,131 @@ def find_txt_for(lora_filename: str) -> Dict[str, Any]:
     txt_path = os.path.join(abs_dir, txt_name)
 
     try:
-        content = _read_txt_file(txt_path)
+        content, encoding = _read_txt_file_with_encoding(txt_path)
     except Exception:
         content = ""
+        encoding = "utf-8"
 
-    return {"found": True, "path": txt_rel, "content": content}
+    return {"found": True, "path": txt_rel, "content": content, "encoding": encoding}
+
+
+def _read_txt_file_with_encoding(path: str) -> Tuple[str, str]:
+    """Read a text file, trying multiple encodings. Returns (content, encoding_used)."""
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    # BOM detection
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", errors="replace"), "utf-8"
+    if raw.startswith(b"\xff\xfe"):
+        return raw[2:].decode("utf-16-le", errors="replace"), "utf-16-le"
+    if raw.startswith(b"\xfe\xff"):
+        return raw[2:].decode("utf-16-be", errors="replace"), "utf-16-be"
+
+    for enc in ("utf-8", "gbk", "gb2312", "utf-16-le", "utf-16-be", "latin-1"):
+        try:
+            return raw.decode(enc), enc
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    return raw.decode("latin-1"), "latin-1"
+
+
+def save_txt_file(txt_rel_path: str, content: str, encoding: str = "utf-8") -> Dict[str, Any]:
+    """Save content back to the TXT file at the given relative path.
+
+    Always writes as UTF-8 WITH BOM (``utf-8-sig``) regardless of the
+    detected original encoding, for maximum cross-platform compatibility:
+
+    * Chinese Windows 资源管理器 reads the BOM and opens the file as UTF-8
+      instead of guessing GBK and producing mojibake (乱码).
+    * Mobile apps can identify the file as a valid TXT.
+    * The plugin reader's BOM detection handles it on the next open.
+
+    The ``encoding`` argument is kept for API compatibility but ignored —
+    the on-disk format is always UTF-8 with BOM.
+
+    Returns:
+        { "success": True, "encoding": "utf-8-sig" }
+        or { "success": False, "error": "..." }
+    """
+    if not txt_rel_path:
+        return {"success": False, "error": "No path provided"}
+
+    txt_rel_path = txt_rel_path.replace("\\", "/")
+    try:
+        lora_dir = folder_paths.get_folder_paths("loras")
+        if not lora_dir:
+            return {"success": False, "error": "LoRA folder not found"}
+        base_dir = lora_dir[0]
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    abs_path = os.path.join(base_dir, txt_rel_path.replace("/", os.sep))
+    abs_dir = os.path.dirname(abs_path)
+    if not os.path.isdir(abs_dir):
+        return {"success": False, "error": f"Directory not found: {abs_dir}"}
+
+    try:
+        # Always write UTF-8 with BOM ("utf-8-sig"). This prepends the
+        # 0xEF 0xBB 0xBF signature so Windows and mobile apps can detect
+        # the encoding correctly.  We also strip any leading BOM the editor
+        # may have already injected into `content` to avoid a double BOM.
+        if content.startswith("\ufeff"):
+            content = content[1:]
+        with open(abs_path, "w", encoding="utf-8-sig") as f:
+            f.write(content)
+        return {"success": True, "encoding": "utf-8-sig"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def open_lora_folder(lora_filename: str) -> Dict[str, Any]:
+    """Open the folder containing the LoRA file in the system file manager.
+
+    * On Windows, ``explorer /select,<path>`` reveals the file inside
+      Explorer (the user sees the file highlighted).
+    * On macOS, ``open -R <path>`` reveals the file inside Finder.
+    * On Linux, ``xdg-open <dir>`` opens the containing directory.
+
+    Returns:
+        { "success": True } or { "success": False, "error": "..." }
+    """
+    if not lora_filename:
+        return {"success": False, "error": "No path provided"}
+
+    lora_filename = lora_filename.replace("\\", "/")
+    dirname = os.path.dirname(lora_filename)
+
+    try:
+        lora_dir = folder_paths.get_folder_paths("loras")
+        if not lora_dir:
+            return {"success": False, "error": "LoRA folder not found"}
+        base_dir = lora_dir[0]
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    abs_dir = os.path.join(base_dir, dirname.replace("/", os.sep)) if dirname else base_dir
+    abs_path = os.path.join(base_dir, lora_filename.replace("/", os.sep))
+
+    if not os.path.isdir(abs_dir):
+        return {"success": False, "error": f"Directory not found: {abs_dir}"}
+    if not os.path.isfile(abs_path):
+        return {"success": False, "error": f"File not found: {abs_path}"}
+
+    try:
+        if sys.platform == "win32":
+            # ``/select,<path>`` reveals the file inside Explorer.  The
+            # comma must be glued to the path (Windows convention).
+            subprocess.Popen(["explorer", f"/select,{os.path.normpath(abs_path)}"])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", abs_path])
+        else:
+            # Linux / other Unix – just open the containing directory.
+            subprocess.Popen(["xdg-open", abs_dir])
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 def _register_routes() -> None:
@@ -369,6 +503,22 @@ def _register_routes() -> None:
     async def _find_txt(request):  # noqa: ANN001
         lora = request.query.get("lora", "")
         return web.json_response(find_txt_for(lora))
+
+    @server.routes.post("/zyf_wan_lora/save-txt")
+    async def _save_txt(request):  # noqa: ANN001
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON"})
+        txt_path = body.get("path", "")
+        content = body.get("content", "")
+        encoding = body.get("encoding", "utf-8")
+        return web.json_response(save_txt_file(txt_path, content, encoding))
+
+    @server.routes.get("/zyf_wan_lora/open-folder")
+    async def _open_folder(request):  # noqa: ANN001
+        lora = request.query.get("lora", "")
+        return web.json_response(open_lora_folder(lora))
 
 
 # Register routes as soon as the module is imported – ComfyUI does this when
@@ -509,16 +659,132 @@ class WanLoraLoader:
         return (model_high, model_low)
 
 
+class SingleLoraLoader:
+    """Loads a stack of LoRAs onto a single MODEL (+ optional CLIP).
+
+    A general-purpose LoRA loader that works with any model/CLIP workflow.
+    Unlike the Wan 2.2 loader, there is no high/low noise split and no
+    auto-pairing logic — each row selects one LoRA file with a single
+    strength value that applies to both MODEL and CLIP.
+
+    The CLIP input is **optional**: when the user does not connect it,
+    the loader silently skips the CLIP side and returns ``(model, None)``.
+    The MODEL input is still required.
+    """
+
+    NAME = SINGLE_NODE_NAME
+    DISPLAY_NAME = SINGLE_DISPLAY_NAME
+    CATEGORY = CATEGORY
+    DESCRIPTION = (
+        "General-purpose LoRA loader: takes a MODEL and (optionally) a "
+        "CLIP, applies a stack of LoRAs in order, and outputs the patched "
+        "MODEL and CLIP. Each row selects one LoRA with a single strength. "
+        "No high/low pairing — works with any single-LoRA workflow."
+    )
+
+    RETURN_TYPES = ("MODEL", "CLIP")
+    RETURN_NAMES = ("MODEL", "CLIP")
+    FUNCTION = "load_loras"
+    OUTPUT_NODE = False
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        # ``clip`` is intentionally optional so the node can be used in
+        # workflows that only need MODEL-side LoRA application.  When
+        # disconnected, the CLIP side is skipped and ``None`` is returned
+        # as the CLIP output.
+        flexible = FlexibleOptionalInputType(ANY, {})
+        flexible["clip"] = ("CLIP",)
+        return {
+            "required": {
+                "model": ("MODEL",),
+            },
+            "optional": flexible,
+            "hidden": {},
+        }
+
+    # ---- Helpers ---------------------------------------------------------
+
+    @staticmethod
+    def _coerce_lora_dict(value: Any) -> Optional[Dict[str, Any]]:
+        """Coerce a widget payload (dict or JSON string) into our LoRA shape."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            import json
+            try:
+                value = json.loads(value)
+            except Exception:
+                return None
+        if not isinstance(value, dict):
+            return None
+        return value
+
+    @staticmethod
+    def _apply_lora(model, clip, lora_name: Optional[str], strength: float):
+        """Apply a single LoRA to model and (optionally) clip.
+
+        Returns ``(model, clip)``.  When ``clip`` is ``None`` the LoRA
+        is only applied to the model and ``None`` is returned for clip.
+        """
+        if not lora_name or strength == 0:
+            return model, clip
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        from nodes import LoraLoader  # type: ignore
+        loader = LoraLoader()
+        if clip is None:
+            # Model-only path – mirror LoraLoaderModelOnly behaviour by
+            # setting the clip strength to 0.  The LoraLoader still
+            # accepts ``None`` for clip in this mode.
+            model, _unused = loader.load_lora(model, None, lora_name, strength, 0.0)
+            return model, None
+        model, clip = loader.load_lora(model, clip, lora_name, strength, strength)
+        return model, clip
+
+    # ---- Main entry ------------------------------------------------------
+
+    def load_loras(self, model, clip=None, **kwargs):
+        # Walk the lora_<n> inputs in numeric order.  Anything that doesn't
+        # decode into our expected dict is silently skipped.
+        loras: List[Dict[str, Any]] = []
+        for key, value in kwargs.items():
+            if not key.lower().startswith("lora_"):
+                continue
+            data = self._coerce_lora_dict(value)
+            if not data:
+                continue
+            loras.append(data)
+
+        # Sort by the trailing number ("lora_1" -> 1, "lora_10" -> 10).
+        def _sort_key(entry: Dict[str, Any]) -> int:
+            return int(entry.get("index", 0))
+
+        loras.sort(key=_sort_key)
+
+        for entry in loras:
+            if not entry.get("on", True):
+                continue
+            strength = float(entry.get("strength", 1.0) or 0.0)
+            model, clip = self._apply_lora(
+                model, clip, entry.get("lora"), strength,
+            )
+
+        return (model, clip)
+
+
 NODE_CLASS_MAPPINGS = {
     "WanLoraLoader": WanLoraLoader,
+    "SingleLoraLoader": SingleLoraLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanLoraLoader": DISPLAY_NAME,
+    "SingleLoraLoader": SINGLE_DISPLAY_NAME,
 }
 
 __all__ = [
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
     "WanLoraLoader",
+    "SingleLoraLoader",
 ]

@@ -81,6 +81,33 @@ async function fetchTxt(loraFilename) {
   }
 }
 
+async function saveTxt(txtPath, content, encoding) {
+  try {
+    const res = await api.fetchApi("/zyf_wan_lora/save-txt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: txtPath, content, encoding: encoding || "utf-8" }),
+    });
+    return await res.json();
+  } catch (err) {
+    console.warn("[zyf-WAN-Lora-Loader] save-txt failed:", err);
+    return { success: false, error: String(err) };
+  }
+}
+
+async function openLoraFolder(loraFilename) {
+  if (!loraFilename) return { success: false, error: "No LoRA selected" };
+  try {
+    const res = await api.fetchApi(
+      "/zyf_wan_lora/open-folder?lora=" + encodeURIComponent(loraFilename)
+    );
+    return await res.json();
+  } catch (err) {
+    console.warn("[zyf-WAN-Lora-Loader] open-folder failed:", err);
+    return { success: false, error: String(err) };
+  }
+}
+
 function makeEmptyRow(index) {
   return {
     index,
@@ -90,6 +117,11 @@ function makeEmptyRow(index) {
     lora_low: null,
     strength_high: 1.0,
     strength_low: 1.0,
+    // Track whether the user explicitly cleared a side via the context
+    // menu, so `rebuildRows` can respect that choice on refresh / new row
+    // instead of silently re-pairing it.
+    cleared_high: false,
+    cleared_low: false,
   };
 }
 
@@ -277,6 +309,8 @@ class WanLoraRowWidget extends ZyfBaseWidget {
       { content: "— clear high —", value: null, callback: () => {
         this.value.lora_high = null;
         this.value.lora = null;
+        // Mark as explicitly cleared so rebuildRows won't re-pair it.
+        this.value.cleared_high = true;
         node.setDirtyCanvas(true, true);
       }},
       null,
@@ -285,6 +319,9 @@ class WanLoraRowWidget extends ZyfBaseWidget {
       // Assign selected file to high noise; the other sibling becomes low noise.
       this.value.lora_high = path;
       this.value.lora = path;
+      // Active high selection: drop the cleared flag.
+      this.value.cleared_high = false;
+      this.value.cleared_low = false;
       const info = await findPair(path, "auto");
       this._pairInfo = info;
       const siblings = info.siblings || [];
@@ -303,6 +340,8 @@ class WanLoraRowWidget extends ZyfBaseWidget {
     const items = [
       { content: "— clear low —", value: null, callback: () => {
         this.value.lora_low = null;
+        // Mark as explicitly cleared so rebuildRows won't re-pair it.
+        this.value.cleared_low = true;
         node.setDirtyCanvas(true, true);
       }},
       null,
@@ -310,6 +349,9 @@ class WanLoraRowWidget extends ZyfBaseWidget {
     const treeItems = buildTreeMenu(this._loraTree, async (path) => {
       // Assign selected file to low noise; the other sibling becomes high noise.
       this.value.lora_low = path;
+      // Active low selection: drop the cleared flag.
+      this.value.cleared_low = false;
+      this.value.cleared_high = false;
       const info = await findPair(path, "auto");
       this._pairInfo = info;
       const siblings = info.siblings || [];
@@ -431,6 +473,18 @@ class WanLoraRowWidget extends ZyfBaseWidget {
       }
     });
 
+    // Open LoRA folder option (uses whichever side is selected)
+    {
+      const loraForFolder = this.value.lora_high || this.value.lora_low;
+      items.push({
+        content: "📁 Open LoRA Folder",
+        disabled: !loraForFolder,
+        callback: () => {
+          if (loraForFolder) openLoraFolder(loraForFolder);
+        },
+      });
+    }
+
     // View TXT file option (only if LoRA is selected)
     if (this.value.lora) {
       items.push({
@@ -460,6 +514,9 @@ class WanLoraRowWidget extends ZyfBaseWidget {
       console.warn("[zyf-WAN-Lora-Loader] No TXT file found for:", this.value.lora);
       return;
     }
+
+    const txtPath = result.path;
+    const txtEncoding = result.encoding || "utf-8";
 
     // Create modal dialog
     const modal = document.createElement("div");
@@ -491,12 +548,13 @@ class WanLoraRowWidget extends ZyfBaseWidget {
       box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
     `;
 
+    // Header row: title + buttons
     const header = document.createElement("div");
     header.style.cssText = `
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 15px;
+      margin-bottom: 10px;
       padding-bottom: 10px;
       border-bottom: 1px solid #3a3f4a;
     `;
@@ -506,8 +564,31 @@ class WanLoraRowWidget extends ZyfBaseWidget {
       color: #d4d4d4;
       font-size: 14px;
       font-weight: bold;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-right: 10px;
     `;
-    title.textContent = `TXT: ${result.path}`;
+    title.textContent = `TXT: ${txtPath}`;
+
+    const btnGroup = document.createElement("div");
+    btnGroup.style.cssText = `
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    `;
+
+    const saveBtn = document.createElement("button");
+    saveBtn.style.cssText = `
+      background: #2b6cb0;
+      color: white;
+      border: none;
+      padding: 5px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    `;
+    saveBtn.textContent = " Save";
 
     const closeBtn = document.createElement("button");
     closeBtn.style.cssText = `
@@ -520,11 +601,23 @@ class WanLoraRowWidget extends ZyfBaseWidget {
       font-size: 12px;
     `;
     closeBtn.textContent = "Close";
-    closeBtn.onclick = () => document.body.removeChild(modal);
 
+    btnGroup.appendChild(saveBtn);
+    btnGroup.appendChild(closeBtn);
     header.appendChild(title);
-    header.appendChild(closeBtn);
+    header.appendChild(btnGroup);
 
+    // Status bar (for save feedback)
+    const statusBar = document.createElement("div");
+    statusBar.style.cssText = `
+      color: #98c379;
+      font-size: 12px;
+      margin-bottom: 8px;
+      min-height: 18px;
+      display: none;
+    `;
+
+    // Editable textarea
     const textarea = document.createElement("textarea");
     textarea.style.cssText = `
       flex: 1;
@@ -537,17 +630,67 @@ class WanLoraRowWidget extends ZyfBaseWidget {
       font-size: 12px;
       resize: none;
       outline: none;
+      white-space: pre-wrap;
+      word-wrap: break-word;
     `;
     textarea.value = result.content;
-    textarea.readOnly = true;
+    textarea.readOnly = false;
+
+    // Track changes to show unsaved indicator
+    let hasChanges = false;
+    textarea.addEventListener("input", () => {
+      hasChanges = true;
+      statusBar.style.display = "block";
+      statusBar.style.color = "#e5c07b";
+      statusBar.textContent = "● Unsaved changes";
+    });
+
+    // Save handler
+    saveBtn.onclick = async () => {
+      saveBtn.disabled = true;
+      statusBar.style.display = "block";
+      statusBar.style.color = "#e5c07b";
+      statusBar.textContent = "Saving...";
+
+      const res = await saveTxt(txtPath, textarea.value, txtEncoding);
+
+      if (res.success) {
+        hasChanges = false;
+        statusBar.style.color = "#98c379";
+        statusBar.textContent = "Saved successfully";
+        setTimeout(() => { statusBar.style.display = "none"; }, 2000);
+      } else {
+        statusBar.style.color = "#e06c75";
+        statusBar.textContent = "Save failed: " + (res.error || "Unknown error");
+      }
+      saveBtn.disabled = false;
+    };
+
+    // Close handler – warn if unsaved
+    closeBtn.onclick = () => {
+      if (hasChanges) {
+        if (confirm("You have unsaved changes. Close anyway?")) {
+          document.body.removeChild(modal);
+        }
+      } else {
+        document.body.removeChild(modal);
+      }
+    };
 
     dialog.appendChild(header);
+    dialog.appendChild(statusBar);
     dialog.appendChild(textarea);
     modal.appendChild(dialog);
 
     modal.onclick = (e) => {
       if (e.target === modal) {
-        document.body.removeChild(modal);
+        if (hasChanges) {
+          if (confirm("You have unsaved changes. Close anyway?")) {
+            document.body.removeChild(modal);
+          }
+        } else {
+          document.body.removeChild(modal);
+        }
       }
     };
 
@@ -694,6 +837,10 @@ class WanLoraRowWidget extends ZyfBaseWidget {
       lora_low: this.value.lora_low,
       strength_high: this.value.strength_high ?? 1.0,
       strength_low: this.value.strength_low ?? 1.0,
+      // Persist the user-intent "cleared" flags so they survive
+      // page reloads / workflow saves.
+      cleared_high: this.value.cleared_high === true,
+      cleared_low: this.value.cleared_low === true,
     };
   }
 }
@@ -926,15 +1073,27 @@ async function rebuildRows(node) {
   for (const r of collectRowWidgets(node)) {
     r.setLoraTree(tree);
     if (r.value.lora_high) {
+      // High is set → verify it exists and re-pair low to it.
       const info = await findPair(r.value.lora_high, "high");
       r._pairInfo = info;
       r.value.lora_high = info.lora_high || null;
       r.value.lora_low = info.lora_low || null;
+      // Active selections on both sides: drop any stale cleared flags.
+      r.value.cleared_high = false;
+      r.value.cleared_low = false;
     } else if (r.value.lora_low) {
+      // Only low is set. Look up the auto-pair, but respect the user's
+      // choice to keep high cleared.
       const info = await findPair(r.value.lora_low, "low");
       r._pairInfo = info;
-      r.value.lora_high = info.lora_high || null;
       r.value.lora_low = info.lora_low || null;
+      if (!r.value.cleared_high) {
+        r.value.lora_high = info.lora_high || null;
+      } else {
+        // Keep high cleared per user intent.
+        r.value.lora_high = null;
+      }
+      r.value.cleared_low = false;
     }
   }
   node.setDirtyCanvas(true, true);
@@ -962,6 +1121,14 @@ function showRowContextMenu(targetWidget, node) {
         if (targetWidget.value.lora_high || targetWidget.value.lora_low) {
           targetWidget.openTxtViewer(node);
         }
+      },
+    },
+    {
+      content: "📁 Open LoRA Folder",
+      disabled: !targetWidget.value.lora_high && !targetWidget.value.lora_low,
+      callback: () => {
+        const f = targetWidget.value.lora_high || targetWidget.value.lora_low;
+        if (f) openLoraFolder(f);
       },
     },
     null,
@@ -1028,11 +1195,11 @@ app.registerExtension({
     nodeType.prototype.onNodeCreated = function () {
       const r = origOnNodeCreated ? origOnNodeCreated.apply(this, arguments) : undefined;
       const node = this;
+      node.serialize_widgets = true;
       ensureRowsAndButtons(node);
       rebuildRows(node).catch((err) =>
         console.error("[zyf-WAN-Lora-Loader] rebuild failed:", err)
       );
-      // Set initial width, compute height from widgets.
       node.size[0] = INITIAL_NODE_WIDTH;
       node.size[1] = node.computeSize()[1];
       node.setDirtyCanvas(true, true);
@@ -1041,8 +1208,16 @@ app.registerExtension({
 
     const origConfigure = nodeType.prototype.configure;
     nodeType.prototype.configure = function (info) {
-      const r = origConfigure ? origConfigure.call(this, info) : undefined;
       const node = this;
+      node.serialize_widgets = true;
+
+      node.widgets = (node.widgets || []).filter(
+        (w) => !(w instanceof ZyfButtonWidget || w instanceof ZyfTitleWidget || w instanceof WanLoraRowWidget)
+      );
+      node._zyfHeaderDone = false;
+
+      const r = origConfigure ? origConfigure.call(this, info) : undefined;
+
       const wv = (info && info.widgets_values) || [];
       const restored = [];
       for (const v of wv) {
@@ -1053,25 +1228,21 @@ app.registerExtension({
           restored.push({ ...makeEmptyRow(v.index), ...v });
         }
       }
-      setTimeout(() => {
-        node.widgets = (node.widgets || []).filter(
-          (w) => !(w instanceof ZyfButtonWidget || w instanceof WanLoraRowWidget)
-        );
-        node._zyfHeaderDone = false;
-        ensureHeader(node);
-        if (restored.length) {
-          for (const row of restored.sort((a, b) => a.index - b.index)) {
-            addRowWidget(node, row);
-          }
-        } else {
-          addRowWidget(node, makeEmptyRow(1));
+
+      ensureHeader(node);
+      if (restored.length) {
+        for (const row of restored.sort((a, b) => a.index - b.index)) {
+          addRowWidget(node, row);
         }
-        // Preserve width, compute height from widgets.
-        node.size[0] = Math.max(node.size[0] || INITIAL_NODE_WIDTH, INITIAL_NODE_WIDTH);
-        node.size[1] = node.computeSize()[1];
-        node.setDirtyCanvas(true, true);
-        rebuildRows(node);
-      }, 0);
+      } else {
+        addRowWidget(node, makeEmptyRow(1));
+      }
+
+      node.size[0] = Math.max(node.size[0] || INITIAL_NODE_WIDTH, INITIAL_NODE_WIDTH);
+      node.size[1] = Math.max(node.size[1] || 0, node.computeSize()[1]);
+      node.setDirtyCanvas(true, true);
+      rebuildRows(node);
+
       return r;
     };
 
@@ -1102,6 +1273,691 @@ app.registerExtension({
       if (slot && slot.widget instanceof WanLoraRowWidget) {
         showRowContextMenu(slot.widget, this);
         return undefined; // Suppress the default LiteGraph menu.
+      }
+      return origGetSlotMenuOptions ? origGetSlotMenuOptions.call(this, slot) : null;
+    };
+  },
+});
+
+// =========================================================================
+// Single LoRA Loader (zyf)
+// =========================================================================
+// A simplified version of the Wan 2.2 loader: single MODEL+CLIP in/out,
+// no high/low pairing, no auto-select logic. Each row picks one LoRA
+// with a single strength value.
+
+const SINGLE_NODE_TYPE = "SingleLoraLoader";
+const SINGLE_EXT_NAME = "zyf.SingleLoraLoader";
+const SINGLE_ROW_HEIGHT = 30;
+
+function makeEmptySingleRow(index) {
+  return {
+    index,
+    on: true,
+    lora: null,
+    strength: 1.0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// SingleLoraRowWidget – one LoRA selector + one weight per row
+// ---------------------------------------------------------------------------
+
+class SingleLoraRowWidget extends ZyfBaseWidget {
+  constructor(name) {
+    super(name);
+    this.value = makeEmptySingleRow(parseInt(name.split("_")[1], 10) || 1);
+    this.options = { serialize: true };
+    this.h = SINGLE_ROW_HEIGHT;
+    this._loraTree = [];
+    this._wtDragMoved = false;
+    this.hitAreas = {
+      toggle:  { bounds: [0, 0], onDown: this.onToggleDown },
+      loraSel: { bounds: [0, 0], onClick: this.onLoraSelectClick },
+      wtDec:   { bounds: [0, 0], onClick: this.onWtDec },
+      wtInc:   { bounds: [0, 0], onClick: this.onWtInc },
+      wtVal:   { bounds: [0, 0], onDown: this.onWtDown, onMove: this.onWtMove, onUp: this.onWtUp, onClick: this.onWtClick },
+    };
+  }
+
+  setLoraTree(tree) {
+    this._loraTree = tree || [];
+  }
+
+  computeSize(width) {
+    return [width, this.h];
+  }
+
+  onToggleDown(_event, _pos, node) {
+    this.value.on = !this.value.on;
+    node.setDirtyCanvas(true, true);
+    return true;
+  }
+
+  async onLoraSelectClick(_event, _pos, node) {
+    const tree = await fetchLoraTree();
+    this.setLoraTree(tree);
+    const items = [
+      { content: "— clear —", value: null, callback: () => {
+        this.value.lora = null;
+        node.setDirtyCanvas(true, true);
+      }},
+      null,
+    ];
+    const treeItems = buildTreeMenu(this._loraTree, (path) => {
+      this.value.lora = path;
+      node.setDirtyCanvas(true, true);
+    });
+    items.push(...treeItems);
+    new LiteGraph.ContextMenu(items, { event: _event, title: "Select LoRA" });
+    return true;
+  }
+
+  onWtDec(_event, _pos, node) {
+    this.value.strength = roundWt((this.value.strength ?? 1) - WT_STEP);
+    node.setDirtyCanvas(true, true);
+    return true;
+  }
+  onWtInc(_event, _pos, node) {
+    this.value.strength = roundWt((this.value.strength ?? 1) + WT_STEP);
+    node.setDirtyCanvas(true, true);
+    return true;
+  }
+  onWtClick(_event, _pos, node) {
+    if (this._wtDragMoved) return true;
+    const canvas = app.canvas;
+    if (canvas && canvas.prompt) {
+      canvas.prompt("Value", String(this.value.strength ?? 1), (v) => {
+        const n = parseFloat(v);
+        if (!isNaN(n)) {
+          this.value.strength = roundWt(n);
+          node.setDirtyCanvas(true, true);
+        }
+      }, _event);
+    }
+    return true;
+  }
+  onWtDown(_event, _pos, _node) {
+    this._wtDragMoved = false;
+    this._wtStartX = _event.clientX || _pos[0];
+    this._wtStartVal = this.value.strength ?? 1;
+    return true;
+  }
+  onWtMove(_event, _pos, node) {
+    const clientX = _event.clientX != null ? _event.clientX : _pos[0];
+    const dx = clientX - this._wtStartX;
+    if (Math.abs(dx) > 2) this._wtDragMoved = true;
+    this.value.strength = roundWt(this._wtStartVal + dx * WT_STEP);
+    node.setDirtyCanvas(true, true);
+    return true;
+  }
+  onWtUp(_event, _pos, node) {
+    node.setDirtyCanvas(true, true);
+    return true;
+  }
+
+  // Right-click context menu
+  onContextMenu(event, _pos, node) {
+    const items = [];
+
+    items.push({
+      content: " Delete this row",
+      callback: () => {
+        const idx = node.widgets.indexOf(this);
+        if (idx >= 0) {
+          node.widgets.splice(idx, 1);
+          const rows = collectSingleRowWidgets(node);
+          rows.forEach((r, i) => {
+            r.value.index = i + 1;
+            r.name = `${LORA_ROW_PREFIX}${i + 1}`;
+          });
+          node.size[1] = Math.max(node.size[1], node.computeSize()[1]);
+          node.setDirtyCanvas(true, true);
+        }
+      }
+    });
+
+    // Open LoRA folder option
+    items.push({
+      content: "📁 Open LoRA Folder",
+      disabled: !this.value.lora,
+      callback: () => {
+        if (this.value.lora) openLoraFolder(this.value.lora);
+      },
+    });
+
+    // View TXT file option
+    if (this.value.lora) {
+      items.push({
+        content: "📄 View TXT",
+        callback: () => this.openTxtViewer(node)
+      });
+    } else {
+      items.push({
+        content: " View TXT (disabled)",
+        disabled: true
+      });
+    }
+
+    new LiteGraph.ContextMenu(items, {
+      event: event,
+      title: "Row Options"
+    });
+    return true;
+  }
+
+  async openTxtViewer(node) {
+    const loraFile = this.value.lora;
+    if (!loraFile) return;
+
+    const result = await fetchTxt(loraFile);
+    if (!result.found) {
+      console.warn("[zyf-SingleLoraLoader] No TXT file found for:", this.value.lora);
+      return;
+    }
+
+    const txtPath = result.path;
+    const txtEncoding = result.encoding || "utf-8";
+
+    const modal = document.createElement("div");
+    modal.style.cssText = `
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.7);
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      padding-top: 5vh;
+      z-index: 10000;
+    `;
+
+    const dialog = document.createElement("div");
+    dialog.style.cssText = `
+      background: #1e1e1e;
+      border: 1px solid #3a3f4a;
+      border-radius: 8px;
+      padding: 20px;
+      width: 85%;
+      max-width: 900px;
+      height: 85vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+    `;
+
+    const header = document.createElement("div");
+    header.style.cssText = `
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #3a3f4a;
+    `;
+
+    const title = document.createElement("div");
+    title.style.cssText = `
+      color: #d4d4d4;
+      font-size: 14px;
+      font-weight: bold;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-right: 10px;
+    `;
+    title.textContent = `TXT: ${txtPath}`;
+
+    const btnGroup = document.createElement("div");
+    btnGroup.style.cssText = `
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    `;
+
+    const saveBtn = document.createElement("button");
+    saveBtn.style.cssText = `
+      background: #2b6cb0;
+      color: white;
+      border: none;
+      padding: 5px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    `;
+    saveBtn.textContent = " Save";
+
+    const closeBtn = document.createElement("button");
+    closeBtn.style.cssText = `
+      background: #a04040;
+      color: white;
+      border: none;
+      padding: 5px 15px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    `;
+    closeBtn.textContent = "Close";
+
+    btnGroup.appendChild(saveBtn);
+    btnGroup.appendChild(closeBtn);
+    header.appendChild(title);
+    header.appendChild(btnGroup);
+
+    const statusBar = document.createElement("div");
+    statusBar.style.cssText = `
+      color: #98c379;
+      font-size: 12px;
+      margin-bottom: 8px;
+      min-height: 18px;
+      display: none;
+    `;
+
+    const textarea = document.createElement("textarea");
+    textarea.style.cssText = `
+      flex: 1;
+      background: #2a2f38;
+      color: #d4d4d4;
+      border: 1px solid #3a3f4a;
+      border-radius: 4px;
+      padding: 10px;
+      font-family: monospace;
+      font-size: 12px;
+      resize: none;
+      outline: none;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    `;
+    textarea.value = result.content;
+    textarea.readOnly = false;
+
+    let hasChanges = false;
+    textarea.addEventListener("input", () => {
+      hasChanges = true;
+      statusBar.style.display = "block";
+      statusBar.style.color = "#e5c07b";
+      statusBar.textContent = "● Unsaved changes";
+    });
+
+    saveBtn.onclick = async () => {
+      saveBtn.disabled = true;
+      statusBar.style.display = "block";
+      statusBar.style.color = "#e5c07b";
+      statusBar.textContent = "Saving...";
+
+      const res = await saveTxt(txtPath, textarea.value, txtEncoding);
+
+      if (res.success) {
+        hasChanges = false;
+        statusBar.style.color = "#98c379";
+        statusBar.textContent = "Saved successfully";
+        setTimeout(() => { statusBar.style.display = "none"; }, 2000);
+      } else {
+        statusBar.style.color = "#e06c75";
+        statusBar.textContent = "Save failed: " + (res.error || "Unknown error");
+      }
+      saveBtn.disabled = false;
+    };
+
+    closeBtn.onclick = () => {
+      if (hasChanges) {
+        if (confirm("You have unsaved changes. Close anyway?")) {
+          document.body.removeChild(modal);
+        }
+      } else {
+        document.body.removeChild(modal);
+      }
+    };
+
+    dialog.appendChild(header);
+    dialog.appendChild(statusBar);
+    dialog.appendChild(textarea);
+    modal.appendChild(dialog);
+
+    modal.onclick = (e) => {
+      if (e.target === modal) {
+        if (hasChanges) {
+          if (confirm("You have unsaved changes. Close anyway?")) {
+            document.body.removeChild(modal);
+          }
+        } else {
+          document.body.removeChild(modal);
+        }
+      }
+    };
+
+    document.body.appendChild(modal);
+    textarea.focus();
+  }
+
+  draw(ctx, node, width, y, height) {
+    const margin = 6;
+    const innerMargin = 4;
+    const accent = LiteGraph.WIDGET_OUTLINE_COLOR || "#3a3f4a";
+    const bg = LiteGraph.WIDGET_BGCOLOR || "#1c1f25";
+    const text = LiteGraph.WIDGET_TEXT_COLOR || "#d4d4d4";
+    const muted = "#7f8794";
+    const blue = "#5b8def";
+    const green = "#98c379";
+    const redOn = "#e06c75";
+
+    // Background row.
+    ctx.fillStyle = this.value.index % 2 === 0 ? "#262b34" : "#1f232b";
+    ctx.fillRect(0, y, width, height);
+    ctx.strokeStyle = "#2a2f38";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, y + height - 0.5);
+    ctx.lineTo(width, y + height - 0.5);
+    ctx.stroke();
+
+    let posX = margin;
+
+    // --- Toggle -----------------------------------------------------
+    const tw = 28;
+    const th = 20;
+    const trackX = posX;
+    const trackY = y + (height - th) / 2;
+    ctx.fillStyle = this.value.on ? green : redOn;
+    ctx.globalAlpha = this.value.on ? 1.0 : 0.4;
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(trackX, trackY, tw, th, th / 2);
+    ctx.fill();
+    ctx.stroke();
+    const knobR = th * 0.35;
+    const knobX = this.value.on ? trackX + tw - th / 2 : trackX + th / 2;
+    const knobY = trackY + th / 2;
+    ctx.fillStyle = "#fff";
+    ctx.beginPath();
+    ctx.arc(knobX, knobY, knobR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1.0;
+    this.hitAreas.toggle.bounds = [trackX, trackY, tw, th];
+    posX += tw + innerMargin;
+
+    // --- LoRA selector box ------------------------------------------
+    const selAreaW = width - posX - margin - 76 - innerMargin;
+    const boxH = height - 6;
+    const boxY = y + (height - boxH) / 2;
+
+    const loraName = this.value.lora || "(no LoRA selected)";
+    const hasLora = !!this.value.lora;
+    const maxTextW = selAreaW - 20;
+
+    const boxBg = "#261a38";
+    const boxBorder = "#7b529e";
+    ctx.fillStyle = boxBg;
+    ctx.strokeStyle = boxBorder;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(posX, boxY, selAreaW, boxH, 3);
+    ctx.fill();
+    ctx.stroke();
+    this.hitAreas.loraSel.bounds = [posX, boxY, selAreaW, boxH];
+
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.font = "10px monospace";
+    ctx.fillStyle = this.value.on ? (hasLora ? "#c678dd" : muted) : muted;
+    ctx.fillText(truncateText(ctx, shortPath(loraName), maxTextW), posX + 6, boxY + boxH / 2);
+
+    // Dropdown arrow
+    ctx.fillStyle = muted;
+    ctx.font = "8px sans-serif";
+    ctx.fillText("▼", posX + selAreaW - 14, boxY + boxH / 2);
+
+    posX += selAreaW + innerMargin;
+
+    // --- Weight control ---------------------------------------------
+    const wtW = 76;
+    const wtH = height - 8;
+    const wtY = y + (height - wtH) / 2;
+    const btnW = 17;
+
+    drawWeightControl(ctx, this.value.on, this.value.strength, null,
+      posX, wtY, wtW, wtH, btnW, accent, bg, text, blue, muted);
+    this.hitAreas.wtDec.bounds = [posX, wtY, btnW, wtH];
+    this.hitAreas.wtVal.bounds = [posX + btnW, wtY, wtW - btnW * 2, wtH];
+    this.hitAreas.wtInc.bounds = [posX + wtW - btnW, wtY, btnW, wtH];
+  }
+
+  serializeValue(_node, _index) {
+    return {
+      index: this.value.index,
+      on: this.value.on !== false,
+      lora: this.value.lora,
+      strength: this.value.strength ?? 1.0,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Single loader helpers
+// ---------------------------------------------------------------------------
+
+function collectSingleRowWidgets(node) {
+  return (node.widgets || []).filter((w) => w instanceof SingleLoraRowWidget);
+}
+
+function addSingleRowWidget(node, row) {
+  const widget = new SingleLoraRowWidget(`${LORA_ROW_PREFIX}${row.index}`);
+  widget.value = { ...makeEmptySingleRow(row.index), ...row };
+  addCustomWidget(node, widget);
+  const btnIdx = node.widgets.findIndex(
+    (w) => w && w.name === "_zyf_btn_add_lora"
+  );
+  if (btnIdx >= 0) {
+    moveWidgetTo(node, widget, btnIdx);
+  }
+  return widget;
+}
+
+function ensureSingleHeader(node) {
+  node.widgets = node.widgets || [];
+  if (node._zyfSingleHeaderDone) return;
+  node._zyfSingleHeaderDone = true;
+
+  addCustomWidget(node, new ZyfButtonWidget(
+    "_zyf_btn_add_lora", "+ Add LoRA", "#2b6cb0",
+    (_event, _pos, n) => {
+      const existing = collectSingleRowWidgets(n);
+      const nextIdx = existing.length
+        ? Math.max(...existing.map((r) => r.value.index)) + 1
+        : 1;
+      const newRow = addSingleRowWidget(n, makeEmptySingleRow(nextIdx));
+      n.size[1] = Math.max(n.size[1], n.computeSize()[1]);
+      n.setDirtyCanvas(true, true);
+      rebuildSingleRows(n);
+      if (newRow && newRow.onLoraSelectClick) {
+        newRow.onLoraSelectClick(_event, _pos, n);
+      }
+      return true;
+    }
+  ));
+}
+
+function ensureSingleRowsAndButtons(node) {
+  ensureSingleHeader(node);
+  if (collectSingleRowWidgets(node).length === 0) {
+    addSingleRowWidget(node, makeEmptySingleRow(1));
+  }
+}
+
+async function rebuildSingleRows(node) {
+  const tree = await fetchLoraTree();
+  for (const r of collectSingleRowWidgets(node)) {
+    r.setLoraTree(tree);
+  }
+  node.setDirtyCanvas(true, true);
+}
+
+function showSingleRowContextMenu(targetWidget, node) {
+  const index = node.widgets.indexOf(targetWidget);
+  const rows = collectSingleRowWidgets(node);
+  const canMoveUp = index > 0 && rows.indexOf(node.widgets[index - 1]) >= 0;
+  const canMoveDown = index < node.widgets.length - 1 && rows.indexOf(node.widgets[index + 1]) >= 0;
+
+  const menuItems = [
+    {
+      content: "📄 View TXT",
+      disabled: !targetWidget.value.lora,
+      callback: () => {
+        if (targetWidget.value.lora) {
+          targetWidget.openTxtViewer(node);
+        }
+      },
+    },
+    {
+      content: "📁 Open LoRA Folder",
+      disabled: !targetWidget.value.lora,
+      callback: () => {
+        if (targetWidget.value.lora) {
+          openLoraFolder(targetWidget.value.lora);
+        }
+      },
+    },
+    null,
+    {
+      content: "⬆️ Move Up",
+      disabled: !canMoveUp,
+      callback: () => {
+        moveWidgetTo(node, targetWidget, index - 1);
+        const remaining = collectSingleRowWidgets(node);
+        remaining.forEach((r, i) => {
+          r.value.index = i + 1;
+          r.name = `${LORA_ROW_PREFIX}${i + 1}`;
+        });
+        rebuildSingleRows(node);
+        node.setDirtyCanvas(true, true);
+      },
+    },
+    {
+      content: "⬇️ Move Down",
+      disabled: !canMoveDown,
+      callback: () => {
+        moveWidgetTo(node, targetWidget, index + 1);
+        const remaining = collectSingleRowWidgets(node);
+        remaining.forEach((r, i) => {
+          r.value.index = i + 1;
+          r.name = `${LORA_ROW_PREFIX}${i + 1}`;
+        });
+        rebuildSingleRows(node);
+        node.setDirtyCanvas(true, true);
+      },
+    },
+    null,
+    {
+      content: "🗑️ Remove",
+      callback: () => {
+        node.widgets.splice(index, 1);
+        const remaining = collectSingleRowWidgets(node);
+        remaining.forEach((r, i) => {
+          r.value.index = i + 1;
+          r.name = `${LORA_ROW_PREFIX}${i + 1}`;
+        });
+        node.size[1] = Math.max(node.size[1], node.computeSize()[1]);
+        node.setDirtyCanvas(true, true);
+      },
+    },
+  ];
+
+  new LiteGraph.ContextMenu(menuItems, {
+    title: "LoRA Row",
+    event: _lastCanvasMouseEvent,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Single LoRA Loader extension registration
+// ---------------------------------------------------------------------------
+
+app.registerExtension({
+  name: SINGLE_EXT_NAME,
+  async beforeRegisterNodeDef(nodeType, nodeData, _app) {
+    if (nodeData.name !== SINGLE_NODE_TYPE) return;
+
+    nodeType.title = "Simple LoRA Loader (zyf)";
+
+    const origOnNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      const r = origOnNodeCreated ? origOnNodeCreated.apply(this, arguments) : undefined;
+      const node = this;
+      node.serialize_widgets = true;
+      ensureSingleRowsAndButtons(node);
+      rebuildSingleRows(node).catch((err) =>
+        console.error("[zyf-SingleLoraLoader] rebuild failed:", err)
+      );
+      node.size[0] = INITIAL_NODE_WIDTH;
+      node.size[1] = node.computeSize()[1];
+      node.setDirtyCanvas(true, true);
+      return r;
+    };
+
+    const origConfigure = nodeType.prototype.configure;
+    nodeType.prototype.configure = function (info) {
+      const node = this;
+      node.serialize_widgets = true;
+
+      node.widgets = (node.widgets || []).filter(
+        (w) => !(w instanceof ZyfButtonWidget || w instanceof ZyfTitleWidget || w instanceof SingleLoraRowWidget)
+      );
+      node._zyfSingleHeaderDone = false;
+
+      const r = origConfigure ? origConfigure.call(this, info) : undefined;
+
+      const wv = (info && info.widgets_values) || [];
+      const restored = [];
+      for (const v of wv) {
+        if (
+          v && typeof v === "object" && typeof v.index === "number" &&
+          ("lora" in v || "strength" in v)
+        ) {
+          restored.push({ ...makeEmptySingleRow(v.index), ...v });
+        }
+      }
+
+      ensureSingleHeader(node);
+      if (restored.length) {
+        for (const row of restored.sort((a, b) => a.index - b.index)) {
+          addSingleRowWidget(node, row);
+        }
+      } else {
+        addSingleRowWidget(node, makeEmptySingleRow(1));
+      }
+
+      node.size[0] = Math.max(node.size[0] || INITIAL_NODE_WIDTH, INITIAL_NODE_WIDTH);
+      node.size[1] = Math.max(node.size[1] || 0, node.computeSize()[1]);
+      node.setDirtyCanvas(true, true);
+      rebuildSingleRows(node);
+
+      return r;
+    };
+
+    // Right-click context menu for single LoRA rows.
+    const origGetSlotInPosition = nodeType.prototype.getSlotInPosition;
+    nodeType.prototype.getSlotInPosition = function (canvasX, canvasY) {
+      for (const w of (this.widgets || [])) {
+        if (w instanceof SingleLoraRowWidget && w.last_y != null) {
+          const wTop = this.pos[1] + w.last_y;
+          const wH = w.computeSize(this.size[0])[1];
+          if (canvasX >= this.pos[0] && canvasX <= this.pos[0] + this.size[0] &&
+              canvasY >= wTop && canvasY < wTop + wH) {
+            return { widget: w, output: { type: "ZYF_SINGLE_LORA_ROW" } };
+          }
+        }
+      }
+      return origGetSlotInPosition ? origGetSlotInPosition.call(this, canvasX, canvasY) : null;
+    };
+
+    const origGetSlotMenuOptions = nodeType.prototype.getSlotMenuOptions;
+    nodeType.prototype.getSlotMenuOptions = function (slot) {
+      if (slot && slot.widget instanceof SingleLoraRowWidget) {
+        showSingleRowContextMenu(slot.widget, this);
+        return undefined;
       }
       return origGetSlotMenuOptions ? origGetSlotMenuOptions.call(this, slot) : null;
     };
